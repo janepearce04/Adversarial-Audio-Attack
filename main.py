@@ -12,6 +12,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils import clean_punctuation
+from whisper_utils import _torch_extract_fbank_features
+
 import torchaudio
 from datasets import load_dataset
 from tqdm import tqdm
@@ -41,6 +44,104 @@ path = hf_hub_download(
     revision="refs/convert/parquet",
     filename="default/validation/0000.parquet",
 )
+
+members = [
+    {"model": wav2vec2_model, "name": "wav2vec2", "processor": wav2vec2_processor},
+    {"model": whisper_model_a, "name": "whisper", "processor": whisper_processor_a},
+    {"model": whisper_model_b, "name": "whisper", "processor": whisper_processor_b},
+]
+ens = EnsembleBIM(members, audio, target_string, eps=0.01, alpha=0.0008, num_iters=600, verbose=True)
+adv_audio, delta, history = ens.attack()
+
+class EnsembleBIM:
+    """
+    Optimizes one perturbation against several ASR models at once.
+    Each member's loss is summed before backward(); since every loss
+    traces back to the same adv_audio leaf, one .backward() call gives
+    the combined gradient across all models. BIM only uses the *sign*
+    of that gradient, so this is equivalent (up to scale) to averaging
+    gradients computed separately per model.
+    """
+
+    def __init__(self, members, audio, target_label, eps, alpha, num_iters=600, beta=0.1, verbose=False):
+        """
+        members: list of dicts, one per model:
+            {"model": nn.Module (eval, on device), "name": "wav2vec2"|"whisper",
+             "processor": matching processor, "weight": float (optional)}
+        """
+        self.members = members
+        for m in self.members:
+            m.setdefault("weight", 1.0 / len(members))
+
+        self.device = next(members[0]["model"].parameters()).device
+        self.eps, self.alpha, self.beta, self.num_iters, self.verbose = eps, alpha, beta, num_iters, verbose
+
+        self.orig_audio = audio.clone().detach().to(self.device)
+        self.adv_audio = audio.clone().detach().to(torch.float32).requires_grad_(True).to(self.device)
+
+        # tokenize the target once per model (different tokenizers/casing rules)
+        for m in self.members:
+            label = clean_punctuation(target_label)
+            label = label.upper() if m["name"] == "wav2vec2" else label.lower()
+            m["target_label"] = label
+            ids = m["processor"](text=label, return_tensors="pt").input_ids.to(self.device)
+            m["target_ids"] = ids
+            m["decoder_input_ids"] = ids[:, :-1]
+            m["labels"] = ids[:, 1:].clone()
+
+    def _member_loss(self, m):
+        if m["name"] == "wav2vec2":
+            x = self.adv_audio.squeeze(0)
+            x = (x - x.mean()) / (x.std() + 1e-6)
+            logits = m["model"](x.unsqueeze(0)).logits
+            target_lengths = torch.tensor([m["target_ids"].size(1)], device=self.device)
+            input_lengths = torch.tensor([logits.size(1)], device=self.device)
+            log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
+            loss_fn = nn.CTCLoss(blank=m["processor"].tokenizer.pad_token_id, zero_infinity=True)
+            return loss_fn(log_probs, m["target_ids"], input_lengths, target_lengths)
+
+        elif m["name"] == "whisper":
+            feats = _torch_extract_fbank_features(self.adv_audio).to(self.device)
+            out = m["model"](input_features=feats, decoder_input_ids=m["decoder_input_ids"], labels=m["labels"])
+            return out.loss
+
+        raise ValueError(f"unknown member type: {m['name']}")
+
+    def attack(self):
+        best_loss, best_adv_audio = float("inf"), None
+        loss_history = []
+
+        for i in range(self.num_iters):
+            self.adv_audio = self.adv_audio.clone().detach().requires_grad_(True)
+
+            total_loss = 0.0
+            per_model = {}
+            for m in self.members:
+                loss = self._member_loss(m)
+                per_model[m["name"]] = loss.item()
+                total_loss = total_loss + m["weight"] * loss
+
+            l2 = torch.norm(self.adv_audio - self.orig_audio, p=2)
+            combined = total_loss + self.beta * l2
+            combined.backward()
+
+            if self.adv_audio.grad is None:
+                raise ValueError("Gradients for adv_audio are None.")
+
+            grad = self.adv_audio.grad
+            self.adv_audio = self.adv_audio - self.alpha * grad.data.sign()
+            self.adv_audio = torch.clamp(self.adv_audio, -1, 1)
+            self.adv_audio = torch.clamp(self.adv_audio, self.orig_audio - self.eps, self.orig_audio + self.eps)
+
+            loss_history.append(round(total_loss.item(), 4))
+            if total_loss.item() < best_loss:
+                best_loss = total_loss.item()
+                best_adv_audio = self.adv_audio.clone().detach()
+
+            if self.verbose and i % 50 == 0:
+                print(f"[{i}] combined={total_loss.item():.4f} per-model={per_model}")
+
+        return best_adv_audio, best_adv_audio - self.orig_audio, loss_history
 
 class BIM:
     def __init__(
